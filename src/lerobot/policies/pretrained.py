@@ -21,7 +21,8 @@ import os
 from importlib.resources import files
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import TYPE_CHECKING, TypedDict, TypeVar, Unpack
+from typing import TYPE_CHECKING, TypedDict, TypeVar
+from typing_extensions import Unpack
 
 from huggingface_hub import HfApi, ModelCard, ModelCardData, hf_hub_download, save_torch_state_dict
 from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
