@@ -340,22 +340,19 @@ def build_rollout_context(
     # ``observation_features`` values are either a tuple (camera shape) or the
     # ``float`` type itself used as a sentinel for scalar motor features —
     # see ``dict[str, type | tuple]`` annotation on ``Robot.observation_features``.
-    # Keep cameras (tuple) plus both joint-position (.pos) and base-velocity (.vel)
-    # scalar state features. LeKiwi's observation.state is 9-dim (6 arm .pos +
-    # x/y/theta.vel) and the policy was trained/normalized on all 9; the old .pos-only
-    # filter fed a 6-dim state into a 9-dim normalizer → RuntimeError (size 6 vs 9).
-    # Pure-arm robots have no .vel state keys, so this is a no-op for them.
+    # fr3-vislab: no suffix filter. Keep cameras and every scalar the robot
+    # declares. Upstream keeps only .pos/.vel, which assumes joint-space naming:
+    # LeKiwi lost its base velocities that way (6-dim state into a 9-dim
+    # normalizer), and an EE-space robot loses ee.x/ee.rx... the same way (8-dim
+    # into a 14-dim normalizer). Widening the suffix list fixes one robot at a
+    # time, so the filter goes instead.
     observation_features_hw = {
-        k: v
-        for k, v in all_obs_features.items()
-        if isinstance(v, tuple) or (v is float and k.endswith((".pos", ".vel")))
+        k: v for k, v in all_obs_features.items() if isinstance(v, tuple) or v is float
     }
-    # Keep both joint-position (.pos) and base-velocity (.vel) action features so
-    # mobile manipulators command the base too (e.g. LeKiwi: 6 arm .pos +
-    # x/y/theta.vel = 9-dim action). Pure-arm robots have no .vel keys, so this is
-    # a no-op for them. Without the .vel keys the base velocities are silently
-    # dropped from dataset_features[ACTION]/ordered_action_keys and the base never moves.
-    action_features_hw = {k: v for k, v in robot.action_features.items() if k.endswith((".pos", ".vel"))}
+    # fr3-vislab: same reason, and it bites harder here. The filter kept only
+    # gripper.pos and dropped all six delta_* commands, leaving one action key for
+    # a 7-vector; the same edge cost LeKiwi its base velocities upstream.
+    action_features_hw = dict(robot.action_features)
 
     # The action side is always needed: sync inference reads action names from
     # ``dataset_features[ACTION]`` to map policy tensors back to robot actions.
