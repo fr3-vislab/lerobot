@@ -37,48 +37,86 @@ __all__ = [
 ]
 
 
-def to_relative_actions(actions: Tensor, state: Tensor, mask: Sequence[bool]) -> Tensor:
+def _r6_to_matrix(r6: Tensor) -> Tensor:
+    """The first two columns of R (..., 6) -> R (..., 3, 3), by Gram-Schmidt."""
+    x = torch.nn.functional.normalize(r6[..., 0:3], dim=-1)
+    y = r6[..., 3:6] - x * (x * r6[..., 3:6]).sum(-1, keepdim=True)
+    y = torch.nn.functional.normalize(y, dim=-1)
+    return torch.stack([x, y, torch.linalg.cross(x, y, dim=-1)], dim=-1)
+
+
+def _matrix_to_r6(rotation: Tensor) -> Tensor:
+    return torch.cat([rotation[..., :, 0], rotation[..., :, 1]], dim=-1)
+
+
+# A relative rotation is stored minus the identity's 6D, so holding still is 0 as for
+# position. Stored as is, two entries sit at ~1 with a spread float32 stats lose (std 0).
+_IDENTITY_R6 = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+
+
+def _convert(actions: Tensor, state: Tensor, mask: Sequence[bool], rotation_start: int | None,
+             to_relative: bool) -> Tensor:
+    mask = list(mask)
+    if rotation_start is not None:
+        # The rotation block is composed, not subtracted: a 6D difference depends on
+        # the orientation it starts from, R_start^T @ R does not.
+        mask[rotation_start : rotation_start + 6] = [False] * 6
+    mask_t = torch.tensor(mask, dtype=actions.dtype, device=actions.device)
+    dims = mask_t.shape[0]
+    # Align state to the same device/dtype as actions. _last_state is cached before
+    # DeviceProcessorStep moves the transition, so it can be on CPU while actions are on CUDA.
+    if state.device != actions.device or state.dtype != actions.dtype:
+        state = state.to(device=actions.device, dtype=actions.dtype)
+    state_offset = state[..., :dims] * mask_t
+    if actions.ndim == 3:
+        state_offset = state_offset.unsqueeze(-2)
+    actions = actions.clone()
+    actions[..., :dims] += -state_offset if to_relative else state_offset
+    if rotation_start is not None:
+        block = slice(rotation_start, rotation_start + 6)
+        start = _r6_to_matrix(state[..., block])
+        if actions.ndim == 3:
+            start = start.unsqueeze(-3)
+        identity = torch.tensor(_IDENTITY_R6, dtype=actions.dtype, device=actions.device)
+        if to_relative:
+            relative = start.transpose(-1, -2) @ _r6_to_matrix(actions[..., block])
+            actions[..., block] = _matrix_to_r6(relative) - identity
+        else:
+            actions[..., block] = _matrix_to_r6(start @ _r6_to_matrix(actions[..., block] + identity))
+    return actions
+
+
+def to_relative_actions(
+    actions: Tensor, state: Tensor, mask: Sequence[bool], rotation_start: int | None = None
+) -> Tensor:
     """Convert absolute actions to relative: relative = action - state (for masked dims).
 
+    A 6D rotation block (first two columns of R) at ``rotation_start`` becomes
+    R_state^T @ R_action instead, minus the identity's 6D.
+
     Args:
         actions: (B, T, action_dim) or (B, action_dim).
         state: (B, state_dim). Broadcast across time dimension.
         mask: Which dims to convert. Can be shorter than action_dim.
+        rotation_start: Index of a 6D rotation block in both action and state, or None.
     """
-    mask_t = torch.tensor(mask, dtype=actions.dtype, device=actions.device)
-    dims = mask_t.shape[0]
-    # Align state to the same device/dtype as actions. _last_state is cached before
-    # DeviceProcessorStep moves the transition, so it can be on CPU while actions are on CUDA.
-    if state.device != actions.device or state.dtype != actions.dtype:
-        state = state.to(device=actions.device, dtype=actions.dtype)
-    state_offset = state[..., :dims] * mask_t
-    if actions.ndim == 3:
-        state_offset = state_offset.unsqueeze(-2)
-    actions = actions.clone()
-    actions[..., :dims] -= state_offset
-    return actions
+    return _convert(actions, state, mask, rotation_start, to_relative=True)
 
 
-def to_absolute_actions(actions: Tensor, state: Tensor, mask: Sequence[bool]) -> Tensor:
+def to_absolute_actions(
+    actions: Tensor, state: Tensor, mask: Sequence[bool], rotation_start: int | None = None
+) -> Tensor:
     """Convert relative actions back to absolute: absolute = relative + state (for masked dims).
 
+    A 6D rotation block at ``rotation_start`` becomes R_state @ R_relative.
+
     Args:
         actions: (B, T, action_dim) or (B, action_dim).
         state: (B, state_dim). Broadcast across time dimension.
         mask: Which dims to convert. Can be shorter than action_dim.
+        rotation_start: Index of a 6D rotation block in both action and state, or None.
     """
-    mask_t = torch.tensor(mask, dtype=actions.dtype, device=actions.device)
-    dims = mask_t.shape[0]
-    # Align state to the same device/dtype as actions. _last_state is cached before
-    # DeviceProcessorStep moves the transition, so it can be on CPU while actions are on CUDA.
-    if state.device != actions.device or state.dtype != actions.dtype:
-        state = state.to(device=actions.device, dtype=actions.dtype)
-    state_offset = state[..., :dims] * mask_t
-    if actions.ndim == 3:
-        state_offset = state_offset.unsqueeze(-2)
-    actions = actions.clone()
-    actions[..., :dims] += state_offset
-    return actions
+    return _convert(actions, state, mask, rotation_start, to_relative=False)
 
 
 @ProcessorStepRegistry.register("relative_actions_processor")
@@ -96,11 +134,15 @@ class RelativeActionsProcessorStep(ProcessorStep):
         exclude_joints: Joint names to keep absolute (not converted to relative).
         action_names: Action dimension names from dataset metadata, used to build
             the mask from exclude_joints. If None, all dims are converted.
+        rotation_6d: Name prefix of six action dims holding a 6D rotation (the first
+            two columns of R, e.g. "ee.r6_"), made relative by composition. None
+            subtracts them like any other dim.
     """
 
     enabled: bool = False
     exclude_joints: list[str] = field(default_factory=list)
     action_names: list[str] | None = None
+    rotation_6d: str | None = None
     _last_state: torch.Tensor | None = field(default=None, init=False, repr=False)
 
     def _build_mask(self, action_dim: int) -> list[bool]:
@@ -122,9 +164,23 @@ class RelativeActionsProcessorStep(ProcessorStep):
 
         return mask
 
+    def rotation_start(self, action_dim: int) -> int | None:
+        """Index of the 6D rotation block named by ``rotation_6d``, or None."""
+        if not self.rotation_6d:
+            return None
+        names = [str(n) for n in (self.action_names or [])[:action_dim]]
+        found = [i for i, n in enumerate(names) if n.startswith(self.rotation_6d)]
+        if len(found) != 6 or found != list(range(found[0], found[0] + 6)):
+            raise ValueError(f"rotation_6d={self.rotation_6d!r} must name 6 consecutive action dims; got {names}")
+        return found[0]
+
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         observation = transition.get(TransitionKey.OBSERVATION, {})
         state = observation.get(OBS_STATE) if observation else None
+        # A policy with observation_delta_indices (SmolVLA: [0]) trains on (B, n_obs, D);
+        # the chunk is relative to the latest one, as the model reads it.
+        if state is not None and state.ndim > 2:
+            state = state[:, -1]
 
         # Always cache state for the paired AbsoluteActionsProcessorStep
         if state is not None:
@@ -139,7 +195,9 @@ class RelativeActionsProcessorStep(ProcessorStep):
             return new_transition
 
         mask = self._build_mask(action.shape[-1])
-        new_transition[TransitionKey.ACTION] = to_relative_actions(action, state, mask)
+        new_transition[TransitionKey.ACTION] = to_relative_actions(
+            action, state, mask, self.rotation_start(action.shape[-1])
+        )
         return new_transition
 
     def get_cached_state(self) -> torch.Tensor | None:
@@ -151,6 +209,7 @@ class RelativeActionsProcessorStep(ProcessorStep):
             "enabled": self.enabled,
             "exclude_joints": self.exclude_joints,
             "action_names": self.action_names,
+            "rotation_6d": self.rotation_6d,
         }
 
     def transform_features(
@@ -199,7 +258,9 @@ class AbsoluteActionsProcessorStep(ProcessorStep):
             return new_transition
 
         mask = self.relative_step._build_mask(action.shape[-1])
-        new_transition[TransitionKey.ACTION] = to_absolute_actions(action, cached_state, mask)
+        new_transition[TransitionKey.ACTION] = to_absolute_actions(
+            action, cached_state, mask, self.relative_step.rotation_start(action.shape[-1])
+        )
         return new_transition
 
     def get_config(self) -> dict[str, Any]:

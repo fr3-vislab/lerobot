@@ -19,9 +19,11 @@ from typing import Any
 import torch
 
 from lerobot.processor import (
+    AbsoluteActionsProcessorStep,
     NewLineTaskProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
+    RelativeActionsProcessorStep,
     TokenizerProcessorStep,
     make_default_policy_processor_steps,
     make_policy_processor_pipelines,
@@ -60,11 +62,20 @@ def make_smolvla_pre_post_processors(
         A tuple containing the configured pre-processor and post-processor pipelines.
     """
 
+    relative_step = RelativeActionsProcessorStep(
+        enabled=config.use_relative_actions,
+        exclude_joints=config.relative_exclude_joints,
+        action_names=config.action_feature_names,
+        rotation_6d=config.relative_rotation_6d,
+    )
+
     steps = make_default_policy_processor_steps(config, dataset_stats)
 
+    # raw -> relative -> normalize -> model -> unnormalize -> absolute, as pi0.5
     input_steps = [
         steps.rename_observations,  # To mimic the same processor as pretrained one
         steps.add_batch_dim,
+        relative_step,
         NewLineTaskProcessorStep(),
         TokenizerProcessorStep(
             tokenizer_name=config.vlm_model_name,
@@ -77,6 +88,7 @@ def make_smolvla_pre_post_processors(
     ]
     output_steps = [
         steps.unnormalize,
+        AbsoluteActionsProcessorStep(enabled=config.use_relative_actions, relative_step=relative_step),
         steps.to_cpu,
     ]
     return make_policy_processor_pipelines(input_steps=input_steps, output_steps=output_steps)

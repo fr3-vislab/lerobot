@@ -331,6 +331,7 @@ class RecomputeStatsConfig(OperationConfig):
     skip_image_video: bool = True
     relative_action: bool = False
     relative_exclude_joints: list[str] | None = None
+    relative_rotation_6d: str | None = None
     chunk_size: int = 50
     num_workers: int = 0
     overwrite: bool = False
@@ -721,6 +722,7 @@ def handle_recompute_stats(cfg: EditDatasetConfig) -> None:
         skip_image_video=cfg.operation.skip_image_video,
         relative_action=cfg.operation.relative_action,
         relative_exclude_joints=cfg.operation.relative_exclude_joints,
+        relative_rotation_6d=cfg.operation.relative_rotation_6d,
         chunk_size=cfg.operation.chunk_size,
         num_workers=cfg.operation.num_workers,
     )
