@@ -56,6 +56,16 @@ class SmolVLAConfig(PreTrainedConfig):
     # Gripper dimensions will remain in absolute values.
     use_delta_joint_actions_aloha: bool = False
 
+    # Relative actions: every action in the chunk minus the state at the chunk start.
+    use_relative_actions: bool = False
+    # Joint names to exclude from relative (kept absolute). Empty list = all dims relative.
+    relative_exclude_joints: list[str] = field(default_factory=lambda: ["gripper"])
+    # Name prefix of a 6D rotation (first two columns of R) made relative by
+    # composition, R_start^T @ R, e.g. "ee.r6_". None subtracts it element-wise.
+    relative_rotation_6d: str | None = None
+    # Populated at runtime from dataset metadata by make_policy.
+    action_feature_names: list[str] | None = None
+
     # Tokenizer
     tokenizer_max_length: int = 48
 

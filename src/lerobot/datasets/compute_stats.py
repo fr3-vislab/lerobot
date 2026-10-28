@@ -18,8 +18,10 @@ from __future__ import annotations
 import logging
 
 import numpy as np
+import torch
 
 from lerobot.processor import RelativeActionsProcessorStep
+from lerobot.processor.relative_action_processor import to_relative_actions
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 from .io_utils import load_image_as_numpy
@@ -660,8 +662,10 @@ def _compute_relative_chunk_batch(
     all_states: np.ndarray,
     chunk_size: int,
     relative_mask: np.ndarray,
+    rotation_start: int | None = None,
 ) -> np.ndarray:
-    """Vectorised relative-action computation for a batch of start indices.
+    """Vectorised relative-action computation for a batch of start indices, through
+    the same ``to_relative_actions`` the training step applies.
 
     Returns an ``(N * chunk_size, action_dim)`` float32 array.
     """
@@ -669,11 +673,10 @@ def _compute_relative_chunk_batch(
         return np.empty((0, all_actions.shape[1]), dtype=np.float32)
     offsets = np.arange(chunk_size)
     frame_idx = start_indices[:, None] + offsets[None, :]
-    chunks = all_actions[frame_idx].copy()
-    states = all_states[start_indices]
-    mask_dim = len(relative_mask)
-    chunks[:, :, :mask_dim] -= states[:, None, :mask_dim] * relative_mask[None, None, :]
-    return chunks.reshape(-1, all_actions.shape[1])
+    chunks = torch.from_numpy(all_actions[frame_idx])
+    states = torch.from_numpy(all_states[start_indices])
+    relative = to_relative_actions(chunks, states, relative_mask.astype(bool).tolist(), rotation_start)
+    return relative.numpy().reshape(-1, all_actions.shape[1])
 
 
 def compute_relative_action_stats(
@@ -682,6 +685,7 @@ def compute_relative_action_stats(
     chunk_size: int,
     exclude_joints: list[str] | None = None,
     num_workers: int = 0,
+    rotation_6d: str | None = None,
 ) -> dict[str, np.ndarray]:
     """Compute normalization statistics for relative actions over the full dataset.
 
@@ -697,6 +701,8 @@ def compute_relative_action_stats(
         chunk_size: Number of consecutive frames per action chunk.
         exclude_joints: Joint names whose dimensions should remain absolute
             (not converted to relative actions).
+        rotation_6d: Name prefix of a 6D rotation block made relative by
+            composition, as ``RelativeActionsProcessorStep.rotation_6d``.
         num_workers: Number of parallel threads for computation. Values ≤1
             mean single-threaded. Numpy releases the GIL so threads give
             real parallelism here.
@@ -717,8 +723,10 @@ def compute_relative_action_stats(
         enabled=True,
         exclude_joints=exclude_joints,
         action_names=action_names,
+        rotation_6d=rotation_6d,
     )
     relative_mask = np.array(mask_step._build_mask(action_dim), dtype=np.float32)
+    rotation_start = mask_step.rotation_start(action_dim)
 
     logging.info("Loading action/state data for relative action stats...")
     all_actions = np.array(hf_dataset[ACTION], dtype=np.float32)
@@ -754,6 +762,7 @@ def compute_relative_action_stats(
                     all_states,
                     chunk_size,
                     relative_mask,
+                    rotation_start,
                 )
                 for batch in batches
             ]
@@ -762,7 +771,9 @@ def compute_relative_action_stats(
     else:
         for batch in batches:
             running_stats.update(
-                _compute_relative_chunk_batch(batch, all_actions, all_states, chunk_size, relative_mask)
+                _compute_relative_chunk_batch(
+                    batch, all_actions, all_states, chunk_size, relative_mask, rotation_start
+                )
             )
 
     stats = running_stats.get_statistics()
